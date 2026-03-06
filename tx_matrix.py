@@ -143,6 +143,57 @@ def main() -> None:
             print(f"[tx] Initial wait: sleeping {INITIAL_WAIT}s so you can place nodes")
             time.sleep(INITIAL_WAIT)
 
+        # =============================================================
+        # Auto-rate baseline test (enable_fixed_rate = N on both sides)
+        # =============================================================
+        print("\n[tx] === Auto-rate baseline (enable_fixed_rate=N) ===")
+        write_sysfs(FIXED_RATE_PATH, "N")
+
+        resp = udp_call(sock, rx_addr, {"cmd": "set_rx_fixed_rate", "enabled": False, "seq": seq}, timeout_s=2.0)
+        seq += 1
+        if resp and resp.get("ok"):
+            print(f"[tx] Receiver ACK, fixed_rate disabled (fixed_rate={resp.get('fixed_rate')})")
+        else:
+            print(f"[tx] Receiver failed to disable fixed_rate: {resp}")
+
+        if GUARD > 0:
+            time.sleep(GUARD)
+
+        print(f"[tx] Auto-rate -> iperf ({duration}s)")
+        iperf_out, ok = run_iperf(rx_ip, iperf_port, duration, hard_timeout=duration + 30)
+
+        flog.write("\n" + "=" * 70 + "\n")
+        flog.write(f"rx_mcs=auto tx_mcs=auto ok={ok} ts={time.time()}\n")
+        flog.write(iperf_out + "\n")
+
+        thr, unit = parse_receiver_throughput(iperf_out)
+        if thr and unit:
+            print(f"[tx] Result: MCS(rx=auto, tx=auto) = {thr} {unit}")
+        else:
+            print(f"[tx] Result: MCS(rx=auto, tx=auto) = (parse failed)")
+
+        writer.writerow(["auto", "auto", thr, unit, "1" if ok else "0", time.strftime("%Y-%m-%d %H:%M:%S")])
+        fcsv.flush()
+
+        if GUARD > 0:
+            time.sleep(GUARD)
+
+        # =============================================================
+        # Re-enable fixed rate on both sides for the MCS sweep
+        # =============================================================
+        print("\n[tx] Re-enabling fixed rate for MCS sweep")
+        write_sysfs(FIXED_RATE_PATH, "Y")
+
+        resp = udp_call(sock, rx_addr, {"cmd": "set_rx_fixed_rate", "enabled": True, "seq": seq}, timeout_s=2.0)
+        seq += 1
+        if resp and resp.get("ok"):
+            print(f"[tx] Receiver ACK, fixed_rate re-enabled (fixed_rate={resp.get('fixed_rate')})")
+        else:
+            print(f"[tx] Receiver failed to re-enable fixed_rate: {resp}")
+
+        # =============================================================
+        # Fixed-MCS matrix sweep
+        # =============================================================
         for rx_mcs in MCS_LIST:
             print(f"\n[tx] Setting receiver MCS to {rx_mcs} (retries until ACK)")
             resp = udp_call(sock, rx_addr, {"cmd": "set_rx_mcs", "mcs": rx_mcs, "seq": seq}, timeout_s=2.0)
@@ -189,4 +240,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
