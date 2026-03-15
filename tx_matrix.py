@@ -233,6 +233,14 @@ def main() -> None:
                 if GUARD > 0:
                     time.sleep(GUARD)
 
+    # =============================================================
+    # Reset both sides to MCS 10 (max range) after sweep
+    # =============================================================
+    set_tx_mcs(10)
+    resp = udp_call(sock, rx_addr, {"cmd": "set_rx_mcs", "mcs": 10, "seq": seq}, timeout_s=2.0)
+    seq += 1
+    print("\n[tx] Reset both sides to MCS 10 for max range")
+
     print(f"\n[tx] Done. Results saved in: {out_dir}/")
     print(f"[tx] Table: {csv_path}")
     print(f"[tx] Raw:   {raw_path}")
