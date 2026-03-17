@@ -44,6 +44,19 @@ def read_tx_mcs() -> str:
         return ""
 
 
+def get_current_bw() -> str:
+    """Read current bandwidth from morsectrl."""
+    try:
+        out = subprocess.check_output(["morsectrl", "bw"], text=True, timeout=5).strip()
+        # Extract just the number (e.g. "1" from "1 MHz" or just "1")
+        m = re.search(r"(\d+)", out)
+        if m:
+            return m.group(1)
+    except Exception as e:
+        print(f"[tx] Warning: could not read bandwidth from morsectrl: {e}")
+    return "unknown"
+
+
 def udp_call(
     sock: socket.socket,
     rx_addr: Tuple[str, int],
@@ -51,10 +64,6 @@ def udp_call(
     timeout_s: float = 2.0,
     retries: int = 999999,
 ) -> Optional[Dict[str, Any]]:
-    """
-    Sends a UDP JSON message and waits for an ACK with matching seq.
-    Retries many times by default so field tests can start whenever the link comes up.
-    """
     data = json.dumps(payload).encode("utf-8")
     sock.settimeout(timeout_s)
 
@@ -73,10 +82,6 @@ def udp_call(
 
 
 def run_iperf(server_ip: str, port: int, duration: int, hard_timeout: int) -> Tuple[str, bool]:
-    """
-    Runs iperf3 with a hard timeout to prevent hangs when the link is bad.
-    Returns (stdout+stderr, ok)
-    """
     try:
         out = subprocess.check_output(
             ["timeout", str(hard_timeout), "iperf3", "-c", server_ip, "-p", str(port), "-t", str(duration)],
@@ -103,10 +108,6 @@ def main() -> None:
             "Usage: sudo env INITIAL_WAIT=600 GUARD=0 python3 tx_matrix.py <rx_ip> <ctrl_port> <iperf_port> <iperf_duration_s>",
             file=sys.stderr,
         )
-        print(
-            "Example: sudo env INITIAL_WAIT=600 GUARD=0 python3 tx_matrix.py 192.168.50.2 9999 5201 60",
-            file=sys.stderr,
-        )
         sys.exit(1)
 
     rx_ip = sys.argv[1]
@@ -118,7 +119,10 @@ def main() -> None:
         print("Morse sysfs paths not found. Is the morse module loaded on this Pi?", file=sys.stderr)
         sys.exit(1)
 
-    out_dir = f"mcs_matrix_{time.strftime('%Y%m%d_%H%M%S')}"
+    # Read current bandwidth from chip
+    bw = get_current_bw()
+
+    out_dir = f"mcs_matrix_{bw}mhz_{time.strftime('%Y%m%d_%H%M%S')}"
     csv_path = f"{out_dir}/results.csv"
     raw_path = f"{out_dir}/raw.log"
     Path(out_dir).mkdir(parents=True, exist_ok=True)
@@ -130,11 +134,12 @@ def main() -> None:
 
     with open(csv_path, "w", newline="") as fcsv, open(raw_path, "w") as flog:
         writer = csv.writer(fcsv)
-        writer.writerow(["rx_mcs", "tx_mcs", "throughput", "unit", "ok", "timestamp"])
+        writer.writerow(["bw_mhz", "rx_mcs", "tx_mcs", "throughput", "unit", "ok", "timestamp"])
 
         print(f"[tx] Receiver control: {rx_ip}:{ctrl_port}")
         print(f"[tx] iperf target:     {rx_ip}:{iperf_port}")
         print(f"[tx] duration:        {duration}s")
+        print(f"[tx] bandwidth:       {bw}MHz")
         print(f"[tx] initial_wait:    {INITIAL_WAIT}s")
         print(f"[tx] guard:           {GUARD}s")
         print(f"[tx] CSV:             {csv_path}")
@@ -146,7 +151,7 @@ def main() -> None:
         # =============================================================
         # Auto-rate baseline test (enable_fixed_rate = N on both sides)
         # =============================================================
-        print("\n[tx] === Auto-rate baseline (enable_fixed_rate=N) ===")
+        print(f"\n[tx] === [{bw}MHz] Auto-rate baseline (enable_fixed_rate=N) ===")
         write_sysfs(FIXED_RATE_PATH, "N")
 
         resp = udp_call(sock, rx_addr, {"cmd": "set_rx_fixed_rate", "enabled": False, "seq": seq}, timeout_s=2.0)
@@ -159,20 +164,20 @@ def main() -> None:
         if GUARD > 0:
             time.sleep(GUARD)
 
-        print(f"[tx] Auto-rate -> iperf ({duration}s)")
+        print(f"[tx] [{bw}MHz] Auto-rate -> iperf ({duration}s)")
         iperf_out, ok = run_iperf(rx_ip, iperf_port, duration, hard_timeout=duration + 30)
 
         flog.write("\n" + "=" * 70 + "\n")
-        flog.write(f"rx_mcs=auto tx_mcs=auto ok={ok} ts={time.time()}\n")
+        flog.write(f"bw={bw}MHz rx_mcs=auto tx_mcs=auto ok={ok} ts={time.time()}\n")
         flog.write(iperf_out + "\n")
 
         thr, unit = parse_receiver_throughput(iperf_out)
         if thr and unit:
-            print(f"[tx] Result: MCS(rx=auto, tx=auto) = {thr} {unit}")
+            print(f"[tx] Result: [{bw}MHz] MCS(rx=auto, tx=auto) = {thr} {unit}")
         else:
-            print(f"[tx] Result: MCS(rx=auto, tx=auto) = (parse failed)")
+            print(f"[tx] Result: [{bw}MHz] MCS(rx=auto, tx=auto) = (parse failed)")
 
-        writer.writerow(["auto", "auto", thr, unit, "1" if ok else "0", time.strftime("%Y-%m-%d %H:%M:%S")])
+        writer.writerow([bw, "auto", "auto", thr, unit, "1" if ok else "0", time.strftime("%Y-%m-%d %H:%M:%S")])
         fcsv.flush()
 
         if GUARD > 0:
@@ -181,7 +186,7 @@ def main() -> None:
         # =============================================================
         # Re-enable fixed rate on both sides for the MCS sweep
         # =============================================================
-        print("\n[tx] Re-enabling fixed rate for MCS sweep")
+        print(f"\n[tx] [{bw}MHz] Re-enabling fixed rate for MCS sweep")
         write_sysfs(FIXED_RATE_PATH, "Y")
 
         resp = udp_call(sock, rx_addr, {"cmd": "set_rx_fixed_rate", "enabled": True, "seq": seq}, timeout_s=2.0)
@@ -195,7 +200,7 @@ def main() -> None:
         # Fixed-MCS matrix sweep
         # =============================================================
         for rx_mcs in MCS_LIST:
-            print(f"\n[tx] Setting receiver MCS to {rx_mcs} (retries until ACK)")
+            print(f"\n[tx] [{bw}MHz] Setting receiver MCS to {rx_mcs} (retries until ACK)")
             resp = udp_call(sock, rx_addr, {"cmd": "set_rx_mcs", "mcs": rx_mcs, "seq": seq}, timeout_s=2.0)
             seq += 1
 
@@ -210,7 +215,7 @@ def main() -> None:
             for tx_mcs in MCS_LIST:
                 set_tx_mcs(tx_mcs)
                 tx_readback = read_tx_mcs()
-                print(f"[tx] RX {rx_mcs} | TX {tx_mcs} (readback {tx_readback}) -> iperf")
+                print(f"[tx] [{bw}MHz] RX {rx_mcs} | TX {tx_mcs} (readback {tx_readback}) -> iperf")
 
                 if GUARD > 0:
                     time.sleep(GUARD)
@@ -218,16 +223,16 @@ def main() -> None:
                 iperf_out, ok = run_iperf(rx_ip, iperf_port, duration, hard_timeout=duration + 30)
 
                 flog.write("\n" + "=" * 70 + "\n")
-                flog.write(f"rx_mcs={rx_mcs} tx_mcs={tx_mcs} ok={ok} ts={time.time()}\n")
+                flog.write(f"bw={bw}MHz rx_mcs={rx_mcs} tx_mcs={tx_mcs} ok={ok} ts={time.time()}\n")
                 flog.write(iperf_out + "\n")
 
                 thr, unit = parse_receiver_throughput(iperf_out)
                 if thr and unit:
-                    print(f"[tx] Result: MCS(rx={rx_mcs}, tx={tx_mcs}) = {thr} {unit}")
+                    print(f"[tx] Result: [{bw}MHz] MCS(rx={rx_mcs}, tx={tx_mcs}) = {thr} {unit}")
                 else:
-                    print(f"[tx] Result: MCS(rx={rx_mcs}, tx={tx_mcs}) = (parse failed)")
+                    print(f"[tx] Result: [{bw}MHz] MCS(rx={rx_mcs}, tx={tx_mcs}) = (parse failed)")
 
-                writer.writerow([rx_mcs, tx_mcs, thr, unit, "1" if ok else "0", time.strftime("%Y-%m-%d %H:%M:%S")])
+                writer.writerow([bw, rx_mcs, tx_mcs, thr, unit, "1" if ok else "0", time.strftime("%Y-%m-%d %H:%M:%S")])
                 fcsv.flush()
 
                 if GUARD > 0:
@@ -239,7 +244,7 @@ def main() -> None:
     set_tx_mcs(10)
     resp = udp_call(sock, rx_addr, {"cmd": "set_rx_mcs", "mcs": 10, "seq": seq}, timeout_s=2.0)
     seq += 1
-    print("\n[tx] Reset both sides to MCS 10 for max range")
+    print(f"\n[tx] Reset both sides to MCS 10 for max range")
 
     print(f"\n[tx] Done. Results saved in: {out_dir}/")
     print(f"[tx] Table: {csv_path}")
