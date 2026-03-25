@@ -23,6 +23,13 @@ INITIAL_WAIT = int(os.getenv("INITIAL_WAIT", "0"))
 # Optional settle delay between steps (seconds). Set GUARD=0 to disable.
 GUARD = int(os.getenv("GUARD", "0"))
 
+# Seconds to wait after disabling fixed rate so the 802.11ah rate controller
+# can converge before we start pumping traffic.
+AUTO_RATE_SETTLE = int(os.getenv("AUTO_RATE_SETTLE", "5"))
+
+# Seconds to wait after restarting iperf3 server so it can bind.
+IPERF_RESTART_WAIT = int(os.getenv("IPERF_RESTART_WAIT", "2"))
+
 # Parse iperf3 receiver summary line like:
 # ... 39.1 Mbits/sec  receiver
 RX_SUMMARY_RE = re.compile(r"\s(\d+(?:\.\d+)?)\s+([KMG]?bits/sec)\s+receiver\s*$")
@@ -70,6 +77,22 @@ def udp_call(
         except Exception:
             continue
     return None
+
+
+def restart_iperf_server(
+    sock: socket.socket,
+    rx_addr: Tuple[str, int],
+    seq: int,
+) -> Tuple[int, bool]:
+    """Ask the RX side to restart its iperf3 server. Returns (new_seq, ok)."""
+    resp = udp_call(sock, rx_addr, {"cmd": "restart_iperf", "seq": seq}, timeout_s=2.0)
+    ok = resp is not None and resp.get("ok", False)
+    if ok:
+        print(f"[tx] Receiver ACK: iperf3 server restarted")
+    else:
+        print(f"[tx] WARNING: iperf3 restart request failed: {resp}")
+    time.sleep(IPERF_RESTART_WAIT)
+    return seq + 1, ok
 
 
 def run_iperf(server_ip: str, port: int, duration: int, hard_timeout: int) -> Tuple[str, bool]:
@@ -134,10 +157,12 @@ def main() -> None:
 
         print(f"[tx] Receiver control: {rx_ip}:{ctrl_port}")
         print(f"[tx] iperf target:     {rx_ip}:{iperf_port}")
-        print(f"[tx] duration:        {duration}s")
-        print(f"[tx] initial_wait:    {INITIAL_WAIT}s")
-        print(f"[tx] guard:           {GUARD}s")
-        print(f"[tx] CSV:             {csv_path}")
+        print(f"[tx] duration:         {duration}s")
+        print(f"[tx] initial_wait:     {INITIAL_WAIT}s")
+        print(f"[tx] guard:            {GUARD}s")
+        print(f"[tx] auto_rate_settle: {AUTO_RATE_SETTLE}s")
+        print(f"[tx] iperf_restart_wait: {IPERF_RESTART_WAIT}s")
+        print(f"[tx] CSV:              {csv_path}")
 
         if INITIAL_WAIT > 0:
             print(f"[tx] Initial wait: sleeping {INITIAL_WAIT}s so you can place nodes")
@@ -156,8 +181,15 @@ def main() -> None:
         else:
             print(f"[tx] Receiver failed to disable fixed_rate: {resp}")
 
+        # Let the 802.11ah rate controller converge before pushing traffic
+        print(f"[tx] Waiting {AUTO_RATE_SETTLE}s for rate controller to settle")
+        time.sleep(AUTO_RATE_SETTLE)
+
         if GUARD > 0:
             time.sleep(GUARD)
+
+        # Restart iperf3 server to avoid stale session issues
+        seq, _ = restart_iperf_server(sock, rx_addr, seq)
 
         print(f"[tx] Auto-rate -> iperf ({duration}s)")
         iperf_out, ok = run_iperf(rx_ip, iperf_port, duration, hard_timeout=duration + 30)
@@ -214,6 +246,9 @@ def main() -> None:
 
                 if GUARD > 0:
                     time.sleep(GUARD)
+
+                # Restart iperf3 server before each test to avoid stale sessions
+                seq, _ = restart_iperf_server(sock, rx_addr, seq)
 
                 iperf_out, ok = run_iperf(rx_ip, iperf_port, duration, hard_timeout=duration + 30)
 
