@@ -31,10 +31,26 @@ def read_rx_mcs() -> str:
 
 
 def start_iperf_server(port: int) -> subprocess.Popen:
-    # Keep it simple: run iperf3 server forever
-    # Log goes to /tmp so you can inspect later if needed.
     logf = open("/tmp/iperf3_server.log", "a", buffering=1)
-    return subprocess.Popen(["iperf3", "-s", "-p", str(port)], stdout=logf, stderr=logf)
+    return subprocess.Popen(
+        ["iperf3", "-s", "-p", str(port), "--one-off"],
+        stdout=logf,
+        stderr=logf,
+    )
+
+
+def restart_iperf_server(proc: subprocess.Popen, port: int) -> subprocess.Popen:
+    """Kill the existing iperf3 server and start a fresh one."""
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            proc.kill()
+            proc.wait(timeout=3)
+        except Exception:
+            pass
+    return start_iperf_server(port)
 
 
 def main():
@@ -70,7 +86,6 @@ def main():
 
         cmd = msg.get("cmd")
         seq = msg.get("seq")
-
         reply = {"ok": True, "seq": seq, "rx_mcs": read_rx_mcs(), "ts": time.time()}
 
         try:
@@ -78,6 +93,7 @@ def main():
                 mcs = int(msg.get("mcs"))
                 set_rx_mcs(mcs)
                 reply["rx_mcs"] = read_rx_mcs()
+                print(f"[rx] MCS set to {mcs} (readback {reply['rx_mcs']})")
 
             elif cmd == "set_rx_fixed_rate":
                 enabled = msg.get("enabled", True)
@@ -87,6 +103,11 @@ def main():
                     write_sysfs(FIXED_RATE_PATH, "N")
                 reply["fixed_rate"] = FIXED_RATE_PATH.read_text().strip()
                 print(f"[rx] fixed_rate set to {'Y' if enabled else 'N'}")
+
+            elif cmd == "restart_iperf":
+                iperf_proc = restart_iperf_server(iperf_proc, iperf_port)
+                reply["restarted"] = True
+                print(f"[rx] iperf3 server restarted on port {iperf_port}")
 
             elif cmd == "ping":
                 pass
