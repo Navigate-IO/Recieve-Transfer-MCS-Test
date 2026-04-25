@@ -6,6 +6,7 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
@@ -33,12 +34,19 @@ IPERF_RESTART_WAIT = int(os.getenv("IPERF_RESTART_WAIT", "2"))
 # MAC address to block for forced relay topology. Leave empty to disable.
 BLOCK_MAC = os.getenv("BLOCK_MAC", "")
 
-# Seconds to wait after re-deleting direct path for BATMAN to reconverge.
-REBLOCK_SETTLE = int(os.getenv("REBLOCK_SETTLE", "5"))
+# Seconds to wait after starting blocker for BATMAN to reconverge.
+REBLOCK_SETTLE = int(os.getenv("REBLOCK_SETTLE", "10"))
+
+# How often the blocker thread deletes the direct path (seconds).
+BLOCK_INTERVAL = float(os.getenv("BLOCK_INTERVAL", "1"))
 
 # Parse iperf3 receiver summary line like:
 # ... 39.1 Mbits/sec  receiver
 RX_SUMMARY_RE = re.compile(r"\s(\d+(?:\.\d+)?)\s+([KMG]?bits/sec)\s+receiver\s*$")
+
+# Background blocker state
+_blocker_thread = None
+_blocker_stop = threading.Event()
 
 
 def write_sysfs(path: Path, value: str) -> None:
@@ -57,16 +65,36 @@ def read_tx_mcs() -> str:
         return ""
 
 
-def reblock_direct_path() -> None:
-    """Re-delete direct mesh path/station to maintain forced relay topology."""
+def start_blocking_direct_path() -> None:
+    """Start a background thread that continuously deletes the direct mesh path."""
+    global _blocker_thread
     if not BLOCK_MAC:
         return
-    subprocess.run(["iw", "dev", "wlan0", "mpath", "del", BLOCK_MAC],
-                   capture_output=True)
-    subprocess.run(["iw", "dev", "wlan0", "station", "del", BLOCK_MAC],
-                   capture_output=True)
-    print(f"[tx] Re-blocked direct path to {BLOCK_MAC}, settling {REBLOCK_SETTLE}s")
+    _blocker_stop.clear()
+
+    def _loop():
+        while not _blocker_stop.is_set():
+            subprocess.run(["iw", "dev", "wlan0", "mpath", "del", BLOCK_MAC],
+                           capture_output=True)
+            subprocess.run(["iw", "dev", "wlan0", "station", "del", BLOCK_MAC],
+                           capture_output=True)
+            _blocker_stop.wait(BLOCK_INTERVAL)
+
+    _blocker_thread = threading.Thread(target=_loop, daemon=True)
+    _blocker_thread.start()
+    print(f"[tx] Background blocker started for {BLOCK_MAC} (interval={BLOCK_INTERVAL}s)")
+    print(f"[tx] Waiting {REBLOCK_SETTLE}s for BATMAN to reconverge through relay")
     time.sleep(REBLOCK_SETTLE)
+
+
+def stop_blocking_direct_path() -> None:
+    """Stop the background blocker thread."""
+    if not BLOCK_MAC:
+        return
+    _blocker_stop.set()
+    if _blocker_thread:
+        _blocker_thread.join(timeout=3)
+    print(f"[tx] Background blocker stopped for {BLOCK_MAC}")
 
 
 def udp_call(
@@ -182,18 +210,21 @@ def main() -> None:
         print(f"[tx] iperf_restart_wait: {IPERF_RESTART_WAIT}s")
         print(f"[tx] block_mac:        {BLOCK_MAC or '(none)'}")
         print(f"[tx] reblock_settle:   {REBLOCK_SETTLE}s")
+        print(f"[tx] block_interval:   {BLOCK_INTERVAL}s")
         print(f"[tx] CSV:              {csv_path}")
 
         if INITIAL_WAIT > 0:
             print(f"[tx] Initial wait: sleeping {INITIAL_WAIT}s so you can place nodes")
             time.sleep(INITIAL_WAIT)
 
+        # Start continuous blocker if BLOCK_MAC is set
+        start_blocking_direct_path()
+
         # =============================================================
         # Auto-rate baseline test (enable_fixed_rate = N on both sides)
         # =============================================================
         print("\n[tx] === Auto-rate baseline (enable_fixed_rate=N) ===")
         write_sysfs(FIXED_RATE_PATH, "N")
-        reblock_direct_path()
 
         resp = udp_call(sock, rx_addr, {"cmd": "set_rx_fixed_rate", "enabled": False, "seq": seq}, timeout_s=2.0)
         seq += 1
@@ -236,7 +267,6 @@ def main() -> None:
         # =============================================================
         print("\n[tx] Re-enabling fixed rate for MCS sweep")
         write_sysfs(FIXED_RATE_PATH, "Y")
-        reblock_direct_path()
 
         resp = udp_call(sock, rx_addr, {"cmd": "set_rx_fixed_rate", "enabled": True, "seq": seq}, timeout_s=2.0)
         seq += 1
@@ -263,7 +293,6 @@ def main() -> None:
 
             for tx_mcs in MCS_LIST:
                 set_tx_mcs(tx_mcs)
-                reblock_direct_path()
                 tx_readback = read_tx_mcs()
                 print(f"[tx] RX {rx_mcs} | TX {tx_mcs} (readback {tx_readback}) -> iperf")
 
@@ -292,8 +321,10 @@ def main() -> None:
                     time.sleep(GUARD)
 
     # =============================================================
-    # Reset both sides to MCS 10 (max range) after sweep
+    # Stop blocker and reset both sides to MCS 10 (max range)
     # =============================================================
+    stop_blocking_direct_path()
+
     set_tx_mcs(10)
     resp = udp_call(sock, rx_addr, {"cmd": "set_rx_mcs", "mcs": 10, "seq": seq}, timeout_s=2.0)
     seq += 1
